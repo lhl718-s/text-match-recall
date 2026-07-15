@@ -1,0 +1,601 @@
+# -*- coding: utf-8 -*-
+"""FullTextMatchRecall — ch103 text recall service.
+
+Dual-path recall:
+  Phase 1 — FlashText exact matching against the word library
+  Phase 2 — vectorSearch API semantic matching (replaces rapidfuzz fuzzy)
+
+Results from both paths are merged by element_id (exact wins on conflict),
+sorted exact-first then by score descending, and top_k truncated.
+
+Word library loading modes:
+  - Hive mode (default, use_hive=True): loads from mccai.ods_tort_sensitive_word_library_d
+    via Kyuubi; requires bigdata.kyuubi in the active Python environment (data-env).
+  - Local mode (local_library_path non-empty): loads from a local parquet/CSV file;
+    use for production deployment (pre-cache the Hive query output).
+  - S3 mode (use_hive=False, no local_library_path): legacy path, loads from S3 partition.
+
+Hive table schema (mccai.ods_tort_sensitive_word_library_d):
+    element_id, element_level, obligee_id, obligee_name,
+    risk_point_id, risk_point_name, words_list, main_words,
+    match_mode, keyword_source, element_desc, element_type_name, element_img, dt
+
+"""
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+
+_NUMERIC_ONLY = re.compile(r'^\s*[\d\s.,%-]+\s*$')
+
+from src.services.retrieval.ocr_service import OcrService
+from src.models.retrieval.text_match import TextMatchConfig, TextMatcher
+
+logger = logging.getLogger(__name__)
+
+_S3_LIBRARY_ROOT = "s3://s3p2prodmccai/individual/ip_detection/sensitive_word_library"
+_HIVE_TABLE = "mccai.ods_tort_sensitive_word_library_d"
+_VALID_LEVELS = {"S", "A", "B"}
+
+
+@dataclass
+class FullTextMatchConfig:
+    model_key:               int  = 103
+    top_k:                   int  = 10
+    use_title:               bool = False
+    dt:                      str  = ""   # empty = yesterday; ignored when local_library_path is set
+    local_library_path:      str  = ""   # non-empty → local load mode (overrides use_hive)
+    use_hive:                bool = True # True → load from Hive table; False → S3 mode
+    # Minimum matched-keyword length per hit source (precision guard).
+    # Candidates whose matched keyword is shorter than the threshold are dropped.
+    min_keyword_len_ocr:     int  = 4    # OCR hits: drop if keyword < 4 chars
+    min_keyword_len_title:   int  = 6    # title-only hits: drop if keyword < 6 chars
+    min_keyword_len_both:    int  = 5    # ocr+title hits: drop if keyword < 5 chars
+    filter_noise_element:    bool = True  # drop element_id == "0" (catch-all noise element)
+    # Per-element keyword blocklist: {element_id_str: {keyword_lower, ...}}
+    element_keyword_blocklist: "dict[str, set[str]]" = field(default_factory=dict)
+    # Title-only blocklist: same format but only applied to title-only hits.
+    element_keyword_blocklist_title_only: "dict[str, set[str]]" = field(default_factory=dict)
+    # TextMatcher config — fuzzy matching disabled; vectorSearch covers semantic recall.
+    text_match: TextMatchConfig = field(
+        default_factory=lambda: TextMatchConfig(enable_fuzzy=False)
+    )
+    # vectorSearch API config
+    vector_search_url:       str   = "http://mcc-vector-search-service-gray.biz.sheincorp.cn/ai/vectorSearch"
+    vector_search_setid:     str   = "tort_element_text_20260611"
+    vector_search_threshold: float = 0.3
+    vector_search_top_k:     int   = 10
+    vector_search_timeout:   int   = 10
+    # How to feed text into vectorSearch (mirrors exact-match use of OCR + title):
+    #   separate  (default): OCR text and title sent as separate queries, results merged
+    #                        by element_id (higher score wins); hit_source tracks origin.
+    #   combined:            OCR text + title concatenated into one query.
+    #   title_only:          Backward-compat; only title used, OCR text ignored.
+    # use_title controls whether title is included in all modes (same as exact matching).
+    vector_search_text_mode: str   = "separate"
+
+
+class FullTextMatchRecall:
+    """Ch103 text recall — FlashText exact match + vectorSearch vector match.
+
+    Loading:
+        svc = FullTextMatchRecall()                      # Hive (default)
+        svc = FullTextMatchRecall(FullTextMatchConfig(
+            local_library_path="data/text_match.parquet" # local pre-cached file
+        ))
+
+    Recall:
+        result = svc.recall(img_url, title)
+        # result == {"ocr_lines": [...], "candidates": [...]}
+        # candidates: unified schema including risk_point_id, risk_point_name
+    """
+
+    def __init__(self, config: FullTextMatchConfig = None):
+        self._cfg = config or FullTextMatchConfig()
+        self._dt  = self._cfg.dt or (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        self._matcher = TextMatcher(self._cfg.text_match)
+        self._has_candidates = False
+        self._img_url_map: Dict[str, str] = {}
+        # risk_point metadata keyed by element_id string
+        self._risk_point_meta: Dict[str, dict] = {}
+        self._ocr = OcrService()
+        self._load_library()
+
+    # ── Public ─────────────────────────────────────────────────────────────────
+
+    def recall(
+        self,
+        img_url: str,
+        title: str,
+        *,
+        top_k: int = None,
+        use_title: bool = None,
+    ) -> Dict[str, Any]:
+        """Return dict with ocr_lines and up to top_k matched candidates.
+
+        Phase 1 (FlashText exact): matches OCR lines and product title against
+        the word library.  Skipped gracefully if the word library failed to load
+        (e.g. Hive partition unavailable) — returns [] for exact candidates only.
+        Phase 2 (vectorSearch): calls the remote API with title + img_url.
+        Runs independently of Phase 1; not affected by word library load failures.
+        Results are merged by element_id (exact wins), sorted exact-first then by
+        recall_score descending, and top_k truncated.
+
+        Each candidate carries hit_source: "ocr" | "title" | "ocr+title" | "vector".
+        """
+        eff_top_k     = top_k     if top_k     is not None else self._cfg.top_k
+        eff_use_title = use_title if use_title is not None else self._cfg.use_title
+
+        if not self._has_candidates:
+            logger.debug(
+                "Word library not loaded — exact match (FlashText) disabled; "
+                "vectorSearch will still run"
+            )
+
+        ocr_lines = self._call_ocr(img_url)
+
+        # Phase 1: FlashText exact matching (returns [] when word library not loaded)
+        exact_candidates = self._run_exact_match(ocr_lines, title, eff_use_title)
+
+        # Phase 2: vectorSearch API (semantic matching)
+        # ocr_lines are passed so vector_search_text_mode can use them.
+        vector_candidates = self._call_vector_search(img_url, title, ocr_lines)
+
+        # Merge: vector fills base dict, exact overwrites on element_id conflict
+        merged: Dict[str, dict] = {}
+        for cand in vector_candidates:
+            merged[cand["element_id"]] = cand
+        for cand in exact_candidates:
+            merged[cand["element_id"]] = cand  # exact wins
+
+        # Sort: exact-first, then by recall_score descending within each group
+        sorted_candidates = sorted(
+            merged.values(),
+            key=lambda c: (c["match_type"] != "exact", -c["recall_score"]),
+        )
+
+        return {"ocr_lines": ocr_lines, "candidates": sorted_candidates[:eff_top_k]}
+
+    # ── Private: exact matching ─────────────────────────────────────────────────
+
+    def _run_exact_match(
+        self,
+        ocr_lines: List[Dict],
+        title: str,
+        use_title: bool,
+    ) -> List[dict]:
+        """Run FlashText exact matching and return candidate dicts."""
+        ocr_texts  = [item["text"] for item in ocr_lines]
+        ocr_hits   = {h.element_id: h for h in self._matcher.match(ocr_texts)}
+        title_hits = (
+            {h.element_id: h for h in self._matcher.match([title] if title else [])}
+            if use_title else {}
+        )
+
+        # Merge OCR + title hits: track hit_source, keep higher-scoring hit
+        merged: Dict[str, tuple] = {}
+        for eid, hit in ocr_hits.items():
+            merged[eid] = (hit, "ocr")
+        for eid, hit in title_hits.items():
+            if eid in merged:
+                prev_hit, _ = merged[eid]
+                best = hit if hit.score > prev_hit.score else prev_hit
+                merged[eid] = (best, "ocr+title")
+            else:
+                merged[eid] = (hit, "title")
+
+        # Precision filters
+        cfg = self._cfg
+        filtered: Dict[str, tuple] = {}
+        for eid, (hit, source) in merged.items():
+            if cfg.filter_noise_element and eid == "0":
+                continue
+            kw_len = len(hit.matched_keyword)
+            if source == "ocr"       and kw_len < cfg.min_keyword_len_ocr:
+                continue
+            if source == "title"     and kw_len < cfg.min_keyword_len_title:
+                continue
+            if source == "ocr+title" and kw_len < cfg.min_keyword_len_both:
+                continue
+            if cfg.element_keyword_blocklist:
+                blocked = cfg.element_keyword_blocklist.get(eid, set())
+                if hit.matched_keyword.lower() in blocked:
+                    continue
+            if source == "title" and cfg.element_keyword_blocklist_title_only:
+                blocked_t = cfg.element_keyword_blocklist_title_only.get(eid, set())
+                if hit.matched_keyword.lower() in blocked_t:
+                    continue
+            filtered[eid] = (hit, source)
+
+        sorted_hits = sorted(filtered.values(), key=lambda x: -x[0].score)
+
+        # Build element_id → best matching OCR line for box info.
+        # When the matched keyword spans multiple lines (cross-line hit), no single
+        # line contains it; ocr_line_lookup[eid] is left absent in that case.
+        ocr_line_lookup: Dict[str, Dict] = {}
+        for eid, hit in ocr_hits.items():
+            if eid not in filtered:
+                continue
+            kw_lower = hit.matched_keyword.lower()
+            # Find the first OCR line that contains the keyword (single-line hit).
+            for item in ocr_lines:
+                if kw_lower in item["text"].lower():
+                    ocr_line_lookup[eid] = item
+                    break
+            # If no single line matched, the keyword was found only in the
+            # joined text (cross-line / multi-line hit) — leave absent so the
+            # candidate-building loop below detects and handles it.
+
+        # Precompute joined OCR text and first-line box for cross-line fallback.
+        ocr_joined_text = " ".join(item["text"] for item in ocr_lines)
+        ocr_first_box   = ocr_lines[0]["box"] if ocr_lines else []
+
+        candidates = []
+        for hit, source in sorted_hits:
+            recall_score = min(hit.score * 0.95, 0.95)
+            ocr_item = ocr_line_lookup.get(hit.element_id)
+            rp = self._risk_point_meta.get(hit.element_id, {})
+            if ocr_item is not None:
+                # Single-line hit: use that line's text and box.
+                cand_ocr_text = ocr_item["text"]
+                cand_ocr_box  = ocr_item.get("box", [])
+                cand_source   = source
+            else:
+                # Cross-line hit: keyword found only in joined text.
+                # Use first OCR line's box as the best available position anchor.
+                cand_ocr_text = ocr_joined_text
+                cand_ocr_box  = ocr_first_box
+                # Distinguish cross-line OCR hits in hit_source for evaluation.
+                cand_source   = "ocr_joined" if source == "ocr" else source
+            candidates.append({
+                "model_key":         self._cfg.model_key,
+                "recall_score":      recall_score,
+                "element_id":        hit.element_id,
+                "element_level":     hit.element_level,
+                "element_type_name": hit.element_type_name,
+                "obligee_name":      hit.obligee_name,
+                "obligee_id":        hit.obligee_id,
+                "element_url":       self._img_url_map.get(str(hit.element_id), ""),
+                "element_desc":      hit.element_desc,
+                "risk_point_id":     rp.get("risk_point_id"),
+                "risk_point_name":   rp.get("risk_point_name", ""),
+                "hit_source":        cand_source,
+                "matched_keyword":   hit.matched_keyword,
+                "match_type":        "exact",
+                "ocr_text":          cand_ocr_text,
+                "ocr_box":           cand_ocr_box,
+            })
+
+        return candidates
+
+    # ── Private: vector matching ────────────────────────────────────────────────
+
+    def _call_vector_search(
+        self, img_url: str, title: str, ocr_lines: List[Dict]
+    ) -> List[dict]:
+        """Call vectorSearch and return vector-match candidates.
+
+        Behaviour is controlled by cfg.vector_search_text_mode and cfg.use_title,
+        mirroring how the exact-match path uses OCR text and title:
+
+          separate  (default): query once with title (if use_title) and once with
+                               OCR text (if any), merge results by element_id
+                               (higher score wins). hit_source distinguishes origin.
+          combined:            concatenate title (if use_title) and OCR text into a
+                               single query.
+          title_only:          only title is used, OCR text is ignored (backward-compat).
+
+        Returns [] on any error — never raises.
+        """
+        cfg  = self._cfg
+        mode = cfg.vector_search_text_mode
+        ocr_text = " ".join(item["text"] for item in ocr_lines).strip()
+
+        if mode == "title_only":
+            text_queries = [(title if cfg.use_title else "", "vector")]
+        elif mode == "combined":
+            parts = []
+            if cfg.use_title and title:
+                parts.append(title)
+            if ocr_text:
+                parts.append(ocr_text)
+            text_queries = [(" ".join(parts), "vector")]
+        else:  # "separate" (default)
+            text_queries = []
+            if cfg.use_title and title:
+                text_queries.append((title, "vector_title"))
+            if ocr_text:
+                text_queries.append((ocr_text, "vector_ocr"))
+            if not text_queries:
+                return []
+
+        merged: Dict[str, dict] = {}
+        for text, hit_source in text_queries:
+            if not text:
+                continue
+            for cand in self._call_vector_search_one(text, hit_source):
+                eid = cand["element_id"]
+                if eid not in merged or cand["recall_score"] > merged[eid]["recall_score"]:
+                    merged[eid] = cand
+
+        # Back-fill ocr_text / ocr_box for OCR-triggered vector hits.
+        # The vector query was built from joined OCR text, so we cannot pinpoint
+        # which line triggered the match; use the full joined text and the first
+        # line's box as a positional anchor (both are one-dimensional, consistent
+        # with the exact-match path).
+        if ocr_lines:
+            ocr_joined_text = " ".join(item["text"] for item in ocr_lines)
+            ocr_first_box   = ocr_lines[0]["box"]
+            for cand in merged.values():
+                if "ocr" in cand["hit_source"]:
+                    cand["ocr_text"] = ocr_joined_text
+                    cand["ocr_box"]  = ocr_first_box
+
+        return list(merged.values())
+
+    def _call_vector_search_one(self, text: str, hit_source: str) -> List[dict]:
+        """Issue one vectorSearch request for the given text, return parsed candidates.
+
+        imgUrl is left empty — the tort_element_text_* setId is a text-vector index
+        and does not use image embeddings.
+        """
+        cfg = self._cfg
+        payload = {
+            "topK":      cfg.vector_search_top_k,
+            "threshold": cfg.vector_search_threshold,
+            "title":     text,
+            "imgUrl":    "",
+            "setIds":    [cfg.vector_search_setid],
+        }
+        try:
+            resp = requests.post(
+                cfg.vector_search_url, json=payload, timeout=cfg.vector_search_timeout
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+        except Exception as exc:
+            logger.warning("vectorSearch API error (hit_source=%s): %s", hit_source, exc)
+            return []
+
+        if str(raw.get("code")) != "0":
+            logger.warning(
+                "vectorSearch returned code=%s (hit_source=%s)", raw.get("code"), hit_source
+            )
+            return []
+
+        hits = (raw.get("info") or {}).get("matchList", {}).get(cfg.vector_search_setid) or []
+        candidates = []
+        for hit in hits:
+            fields = hit.get("fields", {})
+            score  = float(hit.get("score", 0))
+            eid    = str(fields.get("element_id", ""))
+            level  = str(fields.get("element_level", ""))
+            img    = str(fields.get("element_img", "") or "")
+            if level not in _VALID_LEVELS:
+                continue
+            if not img:
+                continue
+            candidates.append({
+                "model_key":         self._cfg.model_key,
+                "recall_score":      score,
+                "element_id":        eid,
+                "element_level":     level,
+                "element_type_name": str(fields.get("element_type_name", "")),
+                "obligee_name":      str(fields.get("obligee_name", "")),
+                "obligee_id":        str(fields.get("obligee_id", "") or ""),
+                "element_url":       img,
+                "element_desc":      str(fields.get("element_desc", "")),
+                "risk_point_id":     fields.get("risk_point_id"),
+                "risk_point_name":   str(fields.get("risk_point_name", "") or ""),
+                "hit_source":        hit_source,
+                "matched_keyword":   "",
+                "match_type":        "vector",
+                "ocr_text":          "",
+                "ocr_box":           [],
+            })
+        return candidates
+
+    # ── Private: library loading ────────────────────────────────────────────────
+
+    def _load_library(self) -> None:
+        """Dispatch to the appropriate loader based on config."""
+        if self._cfg.local_library_path:
+            self._load_library_from_local()
+        elif self._cfg.use_hive:
+            self._load_library_from_hive()
+        else:
+            self._load_library_from_s3()
+
+    def _load_library_from_hive(self) -> None:
+        """Load word library from Hive table via Kyuubi (data-env only).
+
+        Two-step query strategy:
+          1. Try the target date partition (self._dt, defaults to yesterday).
+          2. If that partition is missing or empty, fall back to the latest
+             available partition strictly before the target date.
+        """
+        try:
+            from bigdata.kyuubi import SparkSql  # noqa: F401 — data-env only
+        except ImportError:
+            logger.error(
+                "bigdata.kyuubi not available — run in data-env or set use_hive=False "
+                "with local_library_path pointing to a pre-cached parquet."
+            )
+            return
+
+        _COLS = """
+    element_id, element_level, obligee_id, obligee_name,
+    risk_point_id, risk_point_name, words_list, main_words,
+    element_desc, element_type_name, element_img"""
+
+        try:
+            client = SparkSql(auto_add_limit=False)
+        except Exception as exc:
+            logger.warning("SparkSql client init failed: %s", exc)
+            return
+
+        def _query(where_clause: str):
+            sql = f"SELECT {_COLS}\nFROM {_HIVE_TABLE}\nWHERE {where_clause}"
+            try:
+                return client.read_sql(sql)
+            except Exception as e:
+                logger.warning("Hive query failed (%s): %s", _HIVE_TABLE, e)
+                return None
+
+        # Step 1: target date partition (yesterday by default)
+        df = _query(f"dt = '{self._dt}'")
+        if df is not None and not df.empty:
+            self._build_index_from_df(df, source_name=f"{_HIVE_TABLE}(dt={self._dt})")
+            return
+
+        # Step 2: target partition missing/empty → latest available before it
+        logger.warning(
+            "Hive partition dt=%s is empty or missing — falling back to latest "
+            "available partition before that date",
+            self._dt,
+        )
+        df = _query(
+            f"dt = (SELECT MAX(dt) FROM {_HIVE_TABLE} WHERE dt < '{self._dt}')"
+        )
+        if df is None or df.empty:
+            logger.info(
+                "No fallback Hive partition available — exact match (FlashText) disabled"
+            )
+            return
+
+        self._build_index_from_df(df, source_name=f"{_HIVE_TABLE}(fallback)")
+
+    def _load_library_from_local(self) -> None:
+        """Load word library from a local parquet or CSV file."""
+        import pandas as pd
+
+        text_match_path, _ = self._resolve_paths()
+        p = Path(text_match_path)
+        if not p.exists():
+            logger.warning("text_match file not found: %s", text_match_path)
+            return
+        try:
+            df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+        except Exception as exc:
+            logger.warning("text_match file unreadable (%s): %s", text_match_path, exc)
+            return
+
+        if df.empty:
+            logger.info("text_match file is empty (%s) — text match channel is a no-op", text_match_path)
+            return
+
+        self._build_index_from_df(df, source_name=str(text_match_path))
+
+    def _load_library_from_s3(self) -> None:
+        """Load word library from S3 partition (legacy path)."""
+        import pandas as pd
+
+        text_match_path, _ = self._resolve_paths()
+        try:
+            df = pd.read_parquet(text_match_path)
+        except Exception as exc:
+            logger.warning("S3 text_match parquet not found or unreadable (%s): %s", text_match_path, exc)
+            return
+
+        if df.empty:
+            logger.info("S3 text_match parquet is empty (%s) — text match channel is a no-op", text_match_path)
+            return
+
+        self._build_index_from_df(df, source_name=text_match_path)
+
+    def _build_index_from_df(self, df: Any, source_name: str) -> None:
+        """Build FlashText index and supporting maps from a DataFrame."""
+        import pandas as pd
+
+        def _parse_list(val):
+            if val is None:
+                return []
+            if hasattr(val, "__iter__") and not isinstance(val, str):
+                return list(val)
+            try:
+                return json.loads(val)
+            except (TypeError, ValueError):
+                return []
+
+        # element_img → element_url map
+        if "element_img" in df.columns:
+            self._img_url_map = {
+                str(row["element_id"]): str(row["element_img"]) if pd.notna(row.get("element_img")) else ""
+                for _, row in df[["element_id", "element_img"]].iterrows()
+            }
+
+        # risk_point metadata
+        has_rp = "risk_point_id" in df.columns and "risk_point_name" in df.columns
+        if has_rp:
+            for _, row in df[["element_id", "risk_point_id", "risk_point_name"]].iterrows():
+                eid = str(row["element_id"])
+                self._risk_point_meta[eid] = {
+                    "risk_point_id":   row.get("risk_point_id"),
+                    "risk_point_name": str(row.get("risk_point_name") or ""),
+                }
+
+        elements = []
+        for _, row in df.iterrows():
+            eid = str(row["element_id"])
+            level = str(row.get("element_level", "") or "")
+            # Filter: noise element and invalid levels
+            if self._cfg.filter_noise_element and eid == "0":
+                continue
+            if level not in _VALID_LEVELS:
+                continue
+            elements.append({
+                "element_id":        row["element_id"],
+                "words_list":        _parse_list(row.get("words_list")),
+                "main_words":        _parse_list(row.get("main_words")),
+                "element_desc":      str(row.get("element_desc", "") or ""),
+                "element_level":     level,
+                "element_type_name": str(row.get("element_type_name", "") or ""),
+                "obligee_id":        str(row.get("obligee_id", "") or ""),
+                "obligee_name":      str(row.get("obligee_name", "") or ""),
+            })
+
+        if not elements:
+            logger.info("No valid elements after filtering (%s) — text match channel is a no-op", source_name)
+            return
+
+        self._matcher.build_index(elements)
+        self._has_candidates = True
+        logger.info("Full text match index built: %d element(s) (%s)", len(elements), source_name)
+
+    def _resolve_paths(self):
+        """Return (text_match_path, whitelist_path) for local/S3 modes."""
+        if self._cfg.local_library_path:
+            lib = Path(self._cfg.local_library_path)
+            return str(lib), str(lib.parent / "whitelist.parquet")
+        root = f"{_S3_LIBRARY_ROOT}/dt={self._dt}"
+        return f"{root}/text_match/text_match.parquet", f"{root}/whitelist.parquet"
+
+    # ── Private: OCR ───────────────────────────────────────────────────────────
+
+    def _call_ocr(self, image_url: str) -> List[Dict[str, Any]]:
+        """Return preprocessed OCR lines; returns [] on any error."""
+        items = self._ocr.query_one_structured(image_url)
+        return self._preprocess_ocr_lines(items)
+
+    @staticmethod
+    def _preprocess_ocr_lines(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen: set = set()
+        result: List[Dict[str, Any]] = []
+        for item in items:
+            text = item["text"].strip()
+            if len(text) < 2:
+                continue
+            if _NUMERIC_ONLY.match(text):
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({**item, "text": text})
+        return result
